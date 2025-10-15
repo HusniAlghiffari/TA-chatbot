@@ -191,7 +191,7 @@ body {
 /* ================== */
 /* Styling list fakultas/prodi agar numbering rata */
 .fakultas-list {
-  list-style: decimal inside;
+  list-style: none;
   padding-left: 20px;
   margin-top: 10px;
 }
@@ -203,7 +203,7 @@ body {
 
 /* Sublist prodi */
 .fakultas-list li ul {
-  list-style: decimal inside;
+  list-style: none;
   padding-left: 20px;
   margin-top: 4px;
 }

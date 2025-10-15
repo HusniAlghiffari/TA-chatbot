@@ -17,7 +17,7 @@ function markdownToHTML(text) {
         if (/^\d+\.\s/.test(line)) { // jika diawali angka
             if (!olStarted) {
                 newLines.push('<ol>');
-                olStarted = true;
+                olStarted = false;
             }
             let liText = line.replace(/^\d+\.\s*/, '');
             newLines.push(`<li>${liText}</li>`);

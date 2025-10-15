@@ -8,6 +8,13 @@ import sqlite3
 import json
 import random
 from fuzzywuzzy import fuzz
+from langchain.document_loaders import PyPDFLoader
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.vectorstores import FAISS
+from langchain.embeddings.base import Embeddings
+import re
+import requests
+import glob
 
 # Import Zhipu AI
 from zai import ZhipuAiClient
@@ -26,7 +33,29 @@ ADMIN_HASHED_PASSWORD = os.getenv("ADMIN_HASHED_PASSWORD", "").encode("utf-8")
 ZHIPU_API_KEY = os.getenv("ZHIPU_API_KEY")
 client = ZhipuAiClient(api_key=ZHIPU_API_KEY)
 
+# ---------------- Helpers ---------------- #
+def verify_password(input_password, stored_hash):
+    return bcrypt.checkpw(input_password.encode('utf-8'), stored_hash)
 
+
+def get_jawaban(dosen, nip):
+    template = random.choice(jawaban_variasi)
+    return template.format(dosen=dosen, nip=nip)
+
+
+jawaban_variasi = [
+    "NIP dari {dosen} itu adalah {nip}",
+    "NIP {nip} itu punya {dosen}",
+    "{dosen} punya NIP: {nip}"
+]
+
+
+# ---------------- Dataset Handlers ---------------- #
+def get_undip_response(user_message: str):
+    reply = retrieve_relevant_info(user_message)
+    if reply:
+        return reply
+    return handle_zhipu_ai_with_rag(user_message)
 # ---------------- Load Dataset JSON (Bendera) ---------------- #
 dataset_bendera_data = {}
 try:
@@ -73,79 +102,171 @@ def get_today_question_count():
     conn.close()
     return row[0] if row else 0
 
-# ---------------- Helpers ---------------- #
-def verify_password(input_password, stored_hash):
-    return bcrypt.checkpw(input_password.encode('utf-8'), stored_hash)
+# ---------------- Zhipu AI Embeddings Class ---------------- #
+class ZhipuEmbeddings(Embeddings):
+    def __init__(self, api_key: str, model: str = "embedding-2"):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = "https://open.bigmodel.cn/api/paas/v4/embeddings"
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": self.model,
+            "input": texts
+        }
+        response = requests.post(self.base_url, headers=headers, json=data)
+        response.raise_for_status()
+        result = response.json()
+        return [item['embedding'] for item in result['data']]
+
+    def embed_query(self, text: str) -> list[float]:
+        return self.embed_documents([text])[0]
+
+# ---------------- PDF Processing ---------------- #
+def clean_pdf_text(text):
+    text = re.sub(r'[^\w\s\.\,\-\:\(\)\@]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+def init_pdf_vectorstore_from_folder(folder_path):
+    try:
+        all_documents = []
+        pdf_files = glob.glob(os.path.join(folder_path, "*.pdf"))
+        
+        if not pdf_files:
+            print(f"No PDF files found in {folder_path}")
+            return None
+            
+        print(f"Found {len(pdf_files)} PDF files to process")
+        
+        for pdf_file in pdf_files:
+            print(f"Processing {pdf_file}...")
+            loader = PyPDFLoader(pdf_file)
+            documents = loader.load()
+            
+            # Clean text
+            for doc in documents:
+                doc.page_content = clean_pdf_text(doc.page_content)
+            
+            all_documents.extend(documents)
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            separators=["\n\n", "\n", ".", " "]
+        )
+        texts = text_splitter.split_documents(all_documents)
+        
+        # Use Zhipu AI Embeddings
+        embeddings = ZhipuEmbeddings(api_key=ZHIPU_API_KEY)
+        vectorstore = FAISS.from_documents(texts, embeddings)
+        
+        return vectorstore
+    except Exception as e:
+        print(f"Error processing PDFs: {e}")
+        return None
+
+def retrieve_from_pdf(query: str, k=3):
+    if pdf_vectorstore is None:
+        return ""
+    docs = pdf_vectorstore.similarity_search(query, k=k)
+    return "\n".join([doc.page_content for doc in docs])
+
+# Initialize PDF vectorstore from folder
+pdf_vectorstore = None
+pdf_folder = "pdfs"  # Folder containing PDF files
+
+# Create folder if it doesn't exist
+if not os.path.exists(pdf_folder):
+    os.makedirs(pdf_folder)
+    print(f"Created folder: {pdf_folder}")
+
+pdf_vectorstore = init_pdf_vectorstore_from_folder(pdf_folder)
+if pdf_vectorstore:
+    print("PDFs processed successfully!")
+else:
+    print("No PDFs found or error processing PDFs. RAG functionality will be limited.")
+
+# ---------------- RAG -------------------- #
+def handle_zhipu_ai_with_rag(user_message: str):
+    # Step 1: Retrieve relevant information from both sources
+    relevant_info = retrieve_relevant_info(user_message)
+
+    # Step 2: Create augmented prompt
+    augmented_prompt = f"""
+    Informasi relevan dari database UNDIP:
+    {relevant_info}
+
+    Pertanyaan pengguna: {user_message}
+
+    """
+
+    # Step 3: Send augmented prompt to GLM
+    response = client.chat.completions.create(
+        model="glm-4.5",
+        messages=[
+            {"role": "system", "content": (
+                "Lo sekarang jadi chatbot akademik Universitas Diponegoro (UNDIP). "
+                "Jawaban lo wajib pake bahasa santai, gaul, ala anak muda jaman sekarang 🤙, "
+                "tapi tetep sopan, singkat, jelas, dan gak keluar konteks akademik."
+                "Kalau ditanya pertanyaan kompleks, pikirkan secara mendalam dengan menganalisis "
+                "dari berbagai perspektif sebelum memberikan jawaban yang komprehensif."
+            )},
+            {"role": "user", "content": augmented_prompt + "\n\nPikirkan secara mendalam sebelum menjawab."}
+        ],
+        # ... other parameters
+    )
+
+    return response.choices[0].message.content.strip()
 
 
-def get_jawaban(dosen, nip):
-    template = random.choice(jawaban_variasi)
-    return template.format(dosen=dosen, nip=nip)
+def retrieve_relevant_info(user_message: str):
+    context = ""
 
-jawaban_variasi = [
-    "NIP dari {dosen} itu adalah {nip}",
-    "NIP {nip} itu punya {dosen}",
-    "{dosen} punya NIP: {nip}"
-]
+    # Part 1: Dosen retrieval (existing logic)
+    msg = user_message.lower()
+    relevant_dosen = []
+    keywords = msg.split()
 
-
-# ---------------- Dataset Handlers ---------------- #
-def handle_dataset_bendera(message: str):
-    msg = message.lower()
-    best_match = None
-    best_score = 0
-    
     for item in dataset_bendera_data.get("data_dosen", []):
         nama_dosen = item.get("nama_dosen", "").lower()
         nip = item.get("nip", "")
-        
-        # Hitung kesamaan menggunakan fuzzy matching
-        score = fuzz.partial_ratio(msg, nama_dosen)
-        
-        # Jika skor cukup tinggi dan lebih baik dari sebelumnya
-        if score > 70 and score > best_score:
-            best_score = score
-            best_match = (item.get("nama_dosen", ""), nip)
-        
-        # Cek NIP
-        if nip.lower() in msg:
-            return get_jawaban(item.get("nama_dosen", ""), nip)
-    
-    if best_match:
-        return get_jawaban(best_match[0], best_match[1])
-    
-    return None
+
+        score = 0
+        for keyword in keywords:
+            keyword_score = fuzz.partial_ratio(keyword, nama_dosen)
+            if keyword_score > 70:
+                score += keyword_score
+
+        if nip.lower() in msg or score > 100:
+            relevant_dosen.append({
+                "nama": item.get("nama_dosen", ""),
+                "nip": nip,
+                "score": score if nip.lower() not in msg else 1000
+            })
+
+    if relevant_dosen:
+        relevant_dosen.sort(key=lambda x: x["score"], reverse=True)
+        context += "Informasi dosen yang relevan:\n"
+        for dosen in relevant_dosen:
+            context += f"- Nama: {dosen['nama']}, NIP: {dosen['nip']}\n"
+    else:
+        context += "Tidak ada informasi dosen yang relevan ditemukan.\n"
+
+    # Part 2: PDF retrieval (new)
+    if pdf_vectorstore is not None:
+        pdf_context = retrieve_from_pdf(user_message)
+        if pdf_context.strip():
+            context += "\n\nInformasi dari dokumen:\n"
+            context += pdf_context
+
+    return context
 
 
-def handle_zhipu_ai(user_message: str):
-    try:
-        response = client.chat.completions.create(
-            model="glm-4.5",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Lo sekarang jadi chatbot akademik Universitas Diponegoro (UNDIP). "
-                        "Jawaban lo wajib pake bahasa santai, gaul, ala anak muda jaman sekarang 🤙, "
-                        "tapi tetep sopan, singkat, jelas, dan gak keluar konteks akademik."
-                    ),
-                },
-                {"role": "user", "content": user_message}
-            ],
-            thinking={"type": "enabled"},
-            max_tokens=800,
-            temperature=0.7
-        )
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        print("Error Zhipu:", e)
-        return "⚠️ Maaf bro, ada error pas kita ngehubungin Server🙏"
-
-def get_undip_response(user_message: str):
-    reply = handle_dataset_bendera(user_message)
-    if reply:
-        return reply
-    return handle_zhipu_ai(user_message)
 
 # ---------------- Routes ---------------- #
 @app.route("/")
@@ -157,7 +278,7 @@ def ask():
     data = request.get_json()
     user_message = data.get("message", "")
     save_question()
-    reply = get_undip_response(user_message)
+    reply = handle_zhipu_ai_with_rag(user_message)
     return jsonify({"reply": reply})
 
 @app.route("/login", methods=["GET", "POST"])
